@@ -1,0 +1,93 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --release
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: real-rs
+          path: |
+            target/release/real-rs.exe
+            README.md
+            LICENSE
+            THIRD_PARTY_NOTICES.md
+
+      - name: Release
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $head = (git rev-parse HEAD).Trim()
+
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $tag = $env:GITHUB_REF.Substring('refs/tags/'.Length)
+          } else {
+            $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+            $tag = "v$version"
+          }
+
+          git fetch --tags --force --quiet
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $tagSha = (git rev-parse --verify "$tag^{commit}" 2>$null)
+          if ($LASTEXITCODE -eq 0 -and $tagSha.Trim() -ne $head) {
+            Write-Host "Tag $tag points to $($tagSha.Trim()), not $head; skipping release."
+            exit 0
+          }
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            $release = gh release view $tag --json isDraft,assets | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+            $names = @($release.assets | ForEach-Object { $_.name })
+            if ($names -notcontains "real-rs.exe") {
+              gh release upload $tag target/release/real-rs.exe
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            if ($names -notcontains "LICENSE") {
+              gh release upload $tag LICENSE
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            if ($names -notcontains "THIRD_PARTY_NOTICES.md") {
+              gh release upload $tag THIRD_PARTY_NOTICES.md
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+
+            if ($release.isDraft) {
+              gh release edit $tag --draft=false
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          } else {
+            gh release create $tag target/release/real-rs.exe LICENSE THIRD_PARTY_NOTICES.md --target "$head" --title "real-rs $tag" --generate-notes
+          }
